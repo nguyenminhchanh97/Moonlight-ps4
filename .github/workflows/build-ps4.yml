@@ -1,4 +1,4 @@
-name: Build PS4
+name: Build PS4 Keyboard Mouse
 
 on:
   workflow_dispatch:
