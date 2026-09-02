@@ -83,9 +83,8 @@ int main(void) {
         LOGI("debug_host=host (%s)", cfg.debug_host);
     }
 
-    /* Log file only if the user enables it in settings / ini. */
-    if (cfg.enable_file_log)
-        log_set_file_enabled(1, CONFIG_DIR "/debug.log");
+    /* For diagnostic build, ALWAYS enable file logging */
+    log_set_file_enabled(1, CONFIG_DIR "/debug.log");
 
     log_init(cfg.debug_host, 9999);
     LOGI("=== moonlight-ps4 %s boot ===", VERSION_STR);
