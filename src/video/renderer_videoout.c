@@ -17,6 +17,13 @@
 #define FB_COUNT_BGRA 3
 #define FB_ALIGN 0x200000 // 2 MiB
 #define YCC_STRIDE_MUL 4
+#define VIDEO_OUT_WIDTH 1920
+#define VIDEO_OUT_HEIGHT 1080
+
+typedef struct {
+    int src_x, src_y, src_w, src_h;
+    int dst_x, dst_y, dst_w, dst_h;
+} video_scale_rect_t;
 
 static int s_video = -1;
 static void *s_fb[FB_COUNT_MAX];       /* VA Garlic (VideoOut / flip) */
@@ -41,6 +48,7 @@ static int s_gray_left;  /* gray test frames at start */
 static int s_last_flip_idx = -1;
 static int s_flip_wait_logs;
 static int s_show_stats;
+static video_scaling_mode_t s_scaling_mode = VIDEO_SCALING_STRETCH;
 
 /*
  * BGRA MT: workers claim row bands off an atomic counter, so a slow band does
@@ -55,6 +63,8 @@ typedef struct {
     int dst_h;
     int src_w;
     int src_h;
+    int src_x;
+    int src_y;
     const uint8_t *y;
     const uint8_t *uv;
     int pitch_y;
@@ -62,6 +72,47 @@ typedef struct {
     int nbands;
     const int *x_lut; /* dst-col -> src-col; NULL when src/dst sizes match */
 } nv12_bgra_job_t;
+
+static int calculate_scale_rect(int src_w, int src_h, int dst_w, int dst_h,
+                                video_scaling_mode_t mode, video_scale_rect_t *r) {
+    if (!r || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0)
+        return -1;
+
+    r->src_x = r->src_y = r->dst_x = r->dst_y = 0;
+    r->src_w = src_w;
+    r->src_h = src_h;
+    r->dst_w = dst_w;
+    r->dst_h = dst_h;
+
+    if (mode == VIDEO_SCALING_FIT) {
+        if ((int64_t)dst_w * src_h <= (int64_t)dst_h * src_w) {
+            r->dst_h = (int)((int64_t)src_h * dst_w / src_w);
+            if (r->dst_h < 1) r->dst_h = 1;
+            r->dst_y = (dst_h - r->dst_h) / 2;
+        } else {
+            r->dst_w = (int)((int64_t)src_w * dst_h / src_h);
+            if (r->dst_w < 1) r->dst_w = 1;
+            r->dst_x = (dst_w - r->dst_w) / 2;
+        }
+    } else if (mode == VIDEO_SCALING_FILL) {
+        if ((int64_t)dst_w * src_h >= (int64_t)dst_h * src_w) {
+            r->src_h = (int)((int64_t)src_w * dst_h / dst_w);
+            if (r->src_h < 1) r->src_h = 1;
+            r->src_y = (src_h - r->src_h) / 2;
+        } else {
+            r->src_w = (int)((int64_t)src_h * dst_w / dst_h);
+            if (r->src_w < 1) r->src_w = 1;
+            r->src_x = (src_w - r->src_w) / 2;
+        }
+    }
+
+    /* Keep chroma sampling centered and in bounds for 4:2:0 input. */
+    r->src_x &= ~1;
+    r->src_y &= ~1;
+    if (r->src_x + r->src_w > src_w) r->src_w = src_w - r->src_x;
+    if (r->src_y + r->src_h > src_h) r->src_h = src_h - r->src_y;
+    return r->src_w > 0 && r->src_h > 0 && r->dst_w > 0 && r->dst_h > 0 ? 0 : -1;
+}
 
 #define BGRA_WORKERS_MAX 6
 #define BGRA_WORKERS_DEFAULT 4
@@ -91,10 +142,10 @@ static int s_pipe_fb_idx = -1;
 static void bgra_worker_start(void);
 static void bgra_worker_stop(void);
 static void bgra_resolve_store_mode(void);
-static void bgra_convert_kick(uint8_t *dst, int dst_pitch,
-                              int src_w, int src_h, int dst_w, int dst_h,
-                              const uint8_t *y, const uint8_t *uv,
-                              int pitch_y, int pitch_uv, int main_helps);
+static int bgra_convert_kick(uint8_t *dst, int dst_pitch,
+                             int src_w, int src_h, int dst_w, int dst_h,
+                             const uint8_t *y, const uint8_t *uv,
+                             int pitch_y, int pitch_uv, int main_helps);
 static void bgra_convert_wait(void);
 
 static void fill_solid_u32(uint8_t *dst, int pitch, int h, int width, uint32_t pix) {
@@ -438,28 +489,30 @@ static void yuv_to_bgra(uint8_t *dst, int dst_pitch, int w, int h,
  */
 #define SCALE_LUT_MAX 1920
 static int s_scale_lut[SCALE_LUT_MAX];
-static int s_scale_lut_dst_w, s_scale_lut_src_w;
+static int s_scale_lut_dst_w, s_scale_lut_src_x, s_scale_lut_src_w;
 
-static const int *scale_lut_get(int dst_w, int src_w) {
+static const int *scale_lut_get(int dst_w, int src_x, int src_w) {
     if (dst_w <= 0 || src_w <= 0 || dst_w > SCALE_LUT_MAX)
         return NULL;
-    if (dst_w == s_scale_lut_dst_w && src_w == s_scale_lut_src_w)
+    if (dst_w == s_scale_lut_dst_w && src_x == s_scale_lut_src_x &&
+        src_w == s_scale_lut_src_w)
         return s_scale_lut;
     for (int x = 0; x < dst_w; x++) {
-        int sx = (int)(((int64_t)x * src_w) / dst_w);
-        if (sx >= src_w)
-            sx = src_w - 1;
+        int sx = src_x + (int)(((int64_t)x * src_w) / dst_w);
+        if (sx >= src_x + src_w)
+            sx = src_x + src_w - 1;
         s_scale_lut[x] = sx;
     }
     s_scale_lut_dst_w = dst_w;
+    s_scale_lut_src_x = src_x;
     s_scale_lut_src_w = src_w;
     return s_scale_lut;
 }
 
-static inline int scale_src_row(int dst_row, int dst_h, int src_h) {
-    int sr = (int)(((int64_t)dst_row * src_h) / dst_h);
-    if (sr >= src_h)
-        sr = src_h - 1;
+static inline int scale_src_row(int dst_row, int dst_h, int src_y, int src_h) {
+    int sr = src_y + (int)(((int64_t)dst_row * src_h) / dst_h);
+    if (sr >= src_y + src_h)
+        sr = src_y + src_h - 1;
     return sr;
 }
 
@@ -470,10 +523,9 @@ static inline int scale_src_row(int dst_row, int dst_h, int src_h) {
 static void yuv_to_bgra_scaled(uint8_t *dst, int dst_pitch, int dst_w, int dst_h,
                                const uint8_t *y, const uint8_t *u, const uint8_t *v,
                                int pitch_y, int pitch_u, int pitch_v,
-                               int src_w, int src_h, const int *x_lut) {
-    (void)src_w;
+                               int src_y, int src_h, const int *x_lut) {
     for (int row = 0; row < dst_h; row++) {
-        int src_row = scale_src_row(row, dst_h, src_h);
+        int src_row = scale_src_row(row, dst_h, src_y, src_h);
         int uv_row = src_row / 2;
         uint8_t *drow = dst + (size_t)row * (size_t)dst_pitch;
         const uint8_t *yrow = y + (size_t)src_row * (size_t)pitch_y;
@@ -647,9 +699,9 @@ static void nv12_to_bgra_rows_scaled(uint8_t *dst, int dst_pitch, int dst_w,
                                      int row0, int row1, int dst_h,
                                      const uint8_t *y, const uint8_t *uv,
                                      int pitch_y, int pitch_uv,
-                                     int src_h, const int *x_lut) {
+                                     int src_y, int src_h, const int *x_lut) {
     for (int row = row0; row < row1; row++) {
-        int src_row = scale_src_row(row, dst_h, src_h);
+        int src_row = scale_src_row(row, dst_h, src_y, src_h);
         int uv_row = src_row / 2;
         uint8_t *drow = dst + (size_t)row * (size_t)dst_pitch;
         const uint8_t *yrow = y + (size_t)src_row * (size_t)pitch_y;
@@ -678,7 +730,7 @@ static void bgra_run_bands(void) {
         if (j->x_lut) {
             nv12_to_bgra_rows_scaled(j->dst, j->dst_pitch, j->dst_w, row0, row1,
                                      j->dst_h, j->y, j->uv, j->pitch_y, j->pitch_uv,
-                                     j->src_h, j->x_lut);
+                                     j->src_y, j->src_h, j->x_lut);
         } else {
             nv12_to_bgra_rows(j->dst, j->dst_pitch, j->dst_w, row0, row1,
                               j->y, j->uv, j->pitch_y, j->pitch_uv);
@@ -741,6 +793,14 @@ void video_present_set_bgra_tuning(int workers, int nt_pref) {
     LOGI("present: BGRA tuning workers=%d nt_pref=%d", s_bgra_workers, nt_pref);
 }
 
+void video_present_set_scaling(video_scaling_mode_t mode) {
+    if (mode < VIDEO_SCALING_FIT || mode > VIDEO_SCALING_FILL)
+        mode = VIDEO_SCALING_STRETCH;
+    s_scaling_mode = mode;
+    LOGI("present: scaling=%s", mode == VIDEO_SCALING_FIT ? "fit" :
+         mode == VIDEO_SCALING_FILL ? "fill" : "stretch");
+}
+
 static void bgra_worker_start(void) {
     if (s_bgra_worker_alive)
         return;
@@ -786,30 +846,38 @@ static void bgra_worker_stop(void) {
  * the display's registered resolution). When they differ the frame is
  * nearest-neighbour scaled to fill the whole buffer instead of only writing
  * its top-left src_w x src_h corner. */
-static void bgra_convert_kick(uint8_t *dst, int dst_pitch,
-                              int src_w, int src_h, int dst_w, int dst_h,
-                              const uint8_t *y, const uint8_t *uv,
-                              int pitch_y, int pitch_uv, int main_helps) {
-    const int *lut = (src_w == dst_w && src_h == dst_h)
-                          ? NULL
-                          : scale_lut_get(dst_w, src_w);
-    /* LUT unavailable (dst_w > SCALE_LUT_MAX): fall back to 1:1 clipped copy
-     * rather than reading out of bounds. */
-    if (!lut && (src_w != dst_w || src_h != dst_h)) {
-        dst_w = src_w < dst_w ? src_w : dst_w;
-        dst_h = src_h < dst_h ? src_h : dst_h;
-    }
+static int bgra_convert_kick(uint8_t *dst, int dst_pitch,
+                             int src_w, int src_h, int dst_w, int dst_h,
+                             const uint8_t *y, const uint8_t *uv,
+                             int pitch_y, int pitch_uv, int main_helps) {
+    video_scale_rect_t r;
+    if (calculate_scale_rect(src_w, src_h, dst_w, dst_h, s_scaling_mode, &r) != 0)
+        return -1;
+    if (s_scaling_mode == VIDEO_SCALING_FIT &&
+        (r.dst_w != dst_w || r.dst_h != dst_h))
+        memset(dst, 0, (size_t)dst_pitch * (size_t)dst_h);
+
+    const int identity = r.src_x == 0 && r.src_y == 0 &&
+                         r.src_w == r.dst_w && r.src_h == r.dst_h;
+    const int *lut = identity ? NULL : scale_lut_get(r.dst_w, r.src_x, r.src_w);
+    if (!lut && !identity)
+        return -1;
+
+    dst += (size_t)r.dst_y * (size_t)dst_pitch + (size_t)r.dst_x * 4u;
+    dst_w = r.dst_w;
+    dst_h = r.dst_h;
 
     if (!s_bgra_worker_alive || dst_h < 2) {
         uint64_t t0 = now_us();
         if (lut)
             nv12_to_bgra_rows_scaled(dst, dst_pitch, dst_w, 0, dst_h, dst_h,
-                                     y, uv, pitch_y, pitch_uv, src_h, lut);
+                                     y, uv, pitch_y, pitch_uv,
+                                     r.src_y, r.src_h, lut);
         else
             nv12_to_bgra_rows(dst, dst_pitch, dst_w, 0, dst_h, y, uv, pitch_y, pitch_uv);
         _mm_sfence();
         s_bgra_job_us = now_us() - t0;
-        return;
+        return 0;
     }
     pthread_mutex_lock(&s_bgra_mtx);
     s_bgra_job_us = 0;
@@ -817,8 +885,10 @@ static void bgra_convert_kick(uint8_t *dst, int dst_pitch,
     s_bgra_job.dst_pitch = dst_pitch;
     s_bgra_job.dst_w = dst_w;
     s_bgra_job.dst_h = dst_h;
-    s_bgra_job.src_w = src_w;
-    s_bgra_job.src_h = src_h;
+    s_bgra_job.src_w = r.src_w;
+    s_bgra_job.src_h = r.src_h;
+    s_bgra_job.src_x = r.src_x;
+    s_bgra_job.src_y = r.src_y;
     s_bgra_job.y = y;
     s_bgra_job.uv = uv;
     s_bgra_job.pitch_y = pitch_y;
@@ -837,6 +907,7 @@ static void bgra_convert_kick(uint8_t *dst, int dst_pitch,
         bgra_run_bands();
         bgra_note_elapsed(now_us() - t0);
     }
+    return 0;
 }
 
 static void bgra_convert_wait(void) {
@@ -848,12 +919,15 @@ static void bgra_convert_wait(void) {
     pthread_mutex_unlock(&s_bgra_mtx);
 }
 
-static void nv12_to_bgra(uint8_t *dst, int dst_pitch,
-                         int src_w, int src_h, int dst_w, int dst_h,
-                         const uint8_t *y, const uint8_t *uv,
-                         int pitch_y, int pitch_uv) {
-    bgra_convert_kick(dst, dst_pitch, src_w, src_h, dst_w, dst_h, y, uv, pitch_y, pitch_uv, 1);
+static int nv12_to_bgra(uint8_t *dst, int dst_pitch,
+                        int src_w, int src_h, int dst_w, int dst_h,
+                        const uint8_t *y, const uint8_t *uv,
+                        int pitch_y, int pitch_uv) {
+    if (bgra_convert_kick(dst, dst_pitch, src_w, src_h, dst_w, dst_h,
+                          y, uv, pitch_y, pitch_uv, 1) != 0)
+        return -1;
     bgra_convert_wait();
+    return 0;
 }
 
 static void pack_yuv420p_to_nv12(uint8_t *dst, int dst_pitch, int w, int h,
@@ -876,14 +950,27 @@ static void pack_yuv420p_to_nv12(uint8_t *dst, int dst_pitch, int w, int h,
 }
 
 int video_present_init(int w, int h, int prefer_ycbcr) {
+    int source_w = w;
+    int source_h = h;
+    if (source_w <= 0 || source_h <= 0)
+        return -1;
+    w = VIDEO_OUT_WIDTH;
+    h = VIDEO_OUT_HEIGHT;
+    if (prefer_ycbcr &&
+        (s_scaling_mode != VIDEO_SCALING_STRETCH ||
+         source_w != w || source_h != h)) {
+        LOGW("present: scaling %dx%d -> %dx%d requires BGRA; disabling YCbCr",
+             source_w, source_h, w, h);
+        prefer_ycbcr = 0;
+    }
     /*
      * NEVER call sceVideoOutClose on the hot path: with pending flips
      * (cur=-1) Close hangs → eternal black on stream exit or launch.
      * Always reuse the BGRA present if it already exists.
      */
     if (s_video >= 0 && s_use_bgra && !prefer_ycbcr) {
-        LOGI("present: reuse VideoOut BGRA %dx%d (requested %dx%d)",
-             s_width, s_buf_h, w, h);
+        LOGI("present: reuse VideoOut BGRA %dx%d (source %dx%d)",
+             s_width, s_buf_h, source_w, source_h);
         s_flip_logged = 0;
         s_flip_wait_logs = 0;
         s_gray_left = 0;
@@ -1318,8 +1405,9 @@ int video_present_bgra_pipe_kick(const uint8_t *y, const uint8_t *uv,
     /* Scale src (w x h, decoded) to fill the registered VideoOut buffer
      * (s_width x s_buf_h, the actual display resolution) instead of only
      * writing the top-left w x h corner. */
-    bgra_convert_kick(dst, s_pitch, w, h, s_width, s_buf_h,
-                      y, src_uv, pitch_y, src_uv_pitch, 0);
+    if (bgra_convert_kick(dst, s_pitch, w, h, s_width, s_buf_h,
+                          y, src_uv, pitch_y, src_uv_pitch, 0) != 0)
+        return -1;
     s_pipe_fb_idx = next;
     s_pipe_active = 1;
     return 0;
@@ -1360,7 +1448,9 @@ int video_present_frame(const uint8_t *y, const uint8_t *u, const uint8_t *v,
             /* Scale to fill the whole registered buffer (display resolution)
              * instead of clipping to min(h, s_buf_h): otherwise streaming at
              * e.g. 720p onto a 1080p output only fills the top-left corner. */
-            nv12_to_bgra(dst, s_pitch, w, h, s_width, s_buf_h, y, src_uv, pitch_y, src_uv_pitch);
+            if (nv12_to_bgra(dst, s_pitch, w, h, s_width, s_buf_h,
+                             y, src_uv, pitch_y, src_uv_pitch) != 0)
+                return -1;
         } else {
             nv12_blit_copy(dst, s_pitch, s_buf_h, y, pitch_y, h, w, s_ycc_hrep4);
             (void)src_uv;
@@ -1368,18 +1458,27 @@ int video_present_frame(const uint8_t *y, const uint8_t *u, const uint8_t *v,
         }
     } else {
         if (s_use_bgra) {
-            if (w == s_width && h == s_buf_h) {
-                yuv_to_bgra(dst, s_pitch, w, h, y, u, v, pitch_y, pitch_uv, pitch_uv);
+            video_scale_rect_t r;
+            if (calculate_scale_rect(w, h, s_width, s_buf_h,
+                                     s_scaling_mode, &r) != 0)
+                return -1;
+            if (s_scaling_mode == VIDEO_SCALING_FIT &&
+                (r.dst_w != s_width || r.dst_h != s_buf_h))
+                memset(dst, 0, (size_t)s_pitch * (size_t)s_buf_h);
+            uint8_t *scaled_dst = dst + (size_t)r.dst_y * (size_t)s_pitch +
+                                  (size_t)r.dst_x * 4u;
+            if (r.src_x == 0 && r.src_y == 0 && r.src_w == r.dst_w &&
+                r.src_h == r.dst_h) {
+                yuv_to_bgra(scaled_dst, s_pitch, r.dst_w, r.dst_h,
+                            y, u, v, pitch_y, pitch_uv, pitch_uv);
             } else {
-                const int *lut = scale_lut_get(s_width, w);
+                const int *lut = scale_lut_get(r.dst_w, r.src_x, r.src_w);
                 if (lut) {
-                    yuv_to_bgra_scaled(dst, s_pitch, s_width, s_buf_h, y, u, v,
-                                       pitch_y, pitch_uv, pitch_uv, w, h, lut);
-                } else {
-                    int rows = h < s_buf_h ? h : s_buf_h;
-                    int cols = w < s_width ? w : s_width;
-                    yuv_to_bgra(dst, s_pitch, cols, rows, y, u, v, pitch_y, pitch_uv, pitch_uv);
-                }
+                    yuv_to_bgra_scaled(scaled_dst, s_pitch, r.dst_w, r.dst_h,
+                                       y, u, v, pitch_y, pitch_uv, pitch_uv,
+                                       r.src_y, r.src_h, lut);
+                } else
+                    return -1;
             }
         } else {
             int rows = h < s_buf_h ? h : s_buf_h;

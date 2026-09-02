@@ -9,7 +9,8 @@
 #include "audio/audio_orbis.h"
 #include "video/video.h"
 #include "input/input_pad.h"
-#include "input/input_spike.h"
+#include "input/keyboard_ps4.h"
+#include "input/mouse_ps4.h"
 #include "ui/ui_menu.h"
 
 #include <stdio.h>
@@ -175,6 +176,25 @@ static int stream_play(app_config_t *cfg) {
         LOGE("app not found: '%s'", cfg->app_name);
         return -1;
     }
+#if ML_ENABLE_VIDEODEC2
+    /*
+     * Non-16:9 presets have not been validated on real PS4 hardware. Query
+     * Videodec2 before asking Sunshine to launch one, so an unsupported
+     * hardware configuration never starts a stream we cannot decode.
+     */
+    int preflight_hw = -1;
+    int is_standard_resolution =
+        (cfg->stream.width == 1280 && cfg->stream.height == 720) ||
+        (cfg->stream.width == 1920 && cfg->stream.height == 1080);
+    if (cfg->prefer_hw && !is_standard_resolution) {
+        preflight_hw = video_orbis_probe(cfg->stream.width, cfg->stream.height);
+        if (preflight_hw != 0) {
+            LOGE("stream: Videodec2 rejects requested resolution %dx%d",
+                 cfg->stream.width, cfg->stream.height);
+            return -1;
+        }
+    }
+#endif
     LOGI("launch app_id=%d name='%s' %dx%d@%d bitrate=%d sops=%d localAudio=%d currentGame=%d",
          app_id, cfg->app_name, cfg->stream.width, cfg->stream.height,
          cfg->stream.fps, cfg->stream.bitrate, cfg->sops, cfg->local_audio,
@@ -222,7 +242,8 @@ start_ok:
     if (!cfg->prefer_hw) {
         decoder_reason = "prefer_hw=false";
     } else {
-        int probe = video_orbis_probe(cfg->stream.width, cfg->stream.height);
+        int probe = preflight_hw == 0 ? 0 :
+                    video_orbis_probe(cfg->stream.width, cfg->stream.height);
         if (probe == 0) {
             video_orbis_set_tuning(cfg->dec_pipeline_depth, cfg->dec_thread_prio,
                                    cfg->dec_au_onion, cfg->dec_fb_garlic);
@@ -243,6 +264,7 @@ start_ok:
          cfg->prefer_hw ? "true" : "false", decoder_reason);
     AUDIO_RENDERER_CALLBACKS ar = audio_callbacks_orbis;
 
+    video_present_set_scaling(cfg->scaling_mode);
     video_set_show_stats(cfg->show_stats);
     if (cfg->show_stats && prefer_ycbcr)
         LOGW("stream: Perf overlay requires BGRA; disable YCbCr to see it");
@@ -260,7 +282,8 @@ start_ok:
 
     int ticks = 0;
     while (!input_poll()) {
-        input_spike_poll();
+        keyboard_ps4_poll();
+        mouse_ps4_poll();
         usleep(8000);
         if (++ticks % 125 == 0) {
             video_stats_t st;
@@ -288,6 +311,8 @@ start_ok:
     }
 
     LOGI("leaving loop (quit or disconnect)");
+    keyboard_ps4_release_all();
+    mouse_ps4_release_all();
     LiStopConnection();
     /* No gs_quit_app: leave the game on Sunshine for resume → "paused". */
     LOGN("Stream paused");
@@ -312,8 +337,9 @@ int stream_run(app_config_t *cfg, const char *config_dir) {
         LOGW("input_init failed; menu without pad (auto-launch)");
     } else {
         LOGI("input_init OK");
-        input_spike_init();
     }
+    (void)keyboard_ps4_init();
+    (void)mouse_ps4_init();
 
     int connected = 0;
     if (cfg->host[0]) {
@@ -330,6 +356,8 @@ int stream_run(app_config_t *cfg, const char *config_dir) {
         int m = ui_menu_run(cfg, connected ? &s_server : NULL, config_dir);
         LOGI("ui_menu_run => %d", m);
         if (m < 0) {
+            keyboard_ps4_shutdown();
+            mouse_ps4_shutdown();
             input_shutdown();
             return -1;
         }

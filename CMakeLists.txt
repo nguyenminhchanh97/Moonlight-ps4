@@ -79,7 +79,8 @@ if(PS4)
         src/video/decoder_ffmpeg.c
         src/video/decoder_orbis.c
         src/input/input_pad.c
-        src/input/input_spike.c
+        src/input/keyboard_ps4.c
+        src/input/mouse_ps4.c
         src/ui/ui_draw.c
         src/ui/ui_menu.c
         ${COMMON_SOURCES}

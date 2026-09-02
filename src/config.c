@@ -36,6 +36,7 @@ void config_set_defaults(app_config_t *cfg) {
     cfg->prefer_ycbcr = false;
     cfg->enable_file_log = false;
     cfg->show_stats = false;
+    cfg->scaling_mode = VIDEO_SCALING_STRETCH;
     cfg->dec_pipeline_depth = 2;
     cfg->dec_thread_prio = 700;
     cfg->slices_per_frame = 2;
@@ -147,6 +148,14 @@ int config_load(app_config_t *cfg, const char *dir) {
             cfg->enable_file_log = parse_bool(val);
         else if (!strcmp(key, "show_stats"))
             cfg->show_stats = parse_bool(val);
+        else if (!strcmp(key, "display_scaling")) {
+            if (!strcasecmp(val, "fit"))
+                cfg->scaling_mode = VIDEO_SCALING_FIT;
+            else if (!strcasecmp(val, "fill"))
+                cfg->scaling_mode = VIDEO_SCALING_FILL;
+            else
+                cfg->scaling_mode = VIDEO_SCALING_STRETCH;
+        }
         else if (!strcmp(key, "dec_pipeline_depth"))
             cfg->dec_pipeline_depth = atoi(val);
         else if (!strcmp(key, "dec_thread_prio"))
@@ -218,6 +227,7 @@ int config_save(const app_config_t *cfg, const char *dir) {
             "prefer_ycbcr = %s\n"
             "enable_file_log = %s\n"
             "show_stats = %s\n"
+            "display_scaling = %s\n"
             "dec_pipeline_depth = %d\n"
             "dec_thread_prio = %d\n"
             "slices_per_frame = %d\n"
@@ -235,6 +245,8 @@ int config_save(const app_config_t *cfg, const char *dir) {
             cfg->prefer_ycbcr ? "true" : "false",
             cfg->enable_file_log ? "true" : "false",
             cfg->show_stats ? "true" : "false",
+            cfg->scaling_mode == VIDEO_SCALING_FIT ? "fit" :
+            cfg->scaling_mode == VIDEO_SCALING_FILL ? "fill" : "stretch",
             cfg->dec_pipeline_depth, cfg->dec_thread_prio, cfg->slices_per_frame,
             cfg->dec_au_onion ? "true" : "false",
             cfg->dec_fb_garlic ? "true" : "false",

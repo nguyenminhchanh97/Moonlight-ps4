@@ -25,6 +25,12 @@ typedef enum {
     VIDEO_FRAME_YUV420P,
 } video_frame_format_t;
 
+typedef enum {
+    VIDEO_SCALING_FIT = 0,
+    VIDEO_SCALING_STRETCH = 1,
+    VIDEO_SCALING_FILL = 2,
+} video_scaling_mode_t;
+
 typedef struct {
     unsigned long long decode_us_total;
     unsigned long long convert_us_total; /* bounce + blit/bgra */
@@ -71,6 +77,7 @@ void video_stats_get_live(video_live_stats_t *out);
 /* workers <= 0 keeps the default. nt_pref: -1 auto (from the framebuffer
  * mapping), 0 forces cached stores, 1 forces streaming stores. */
 void video_present_set_bgra_tuning(int workers, int nt_pref);
+void video_present_set_scaling(video_scaling_mode_t mode);
 int video_present_init(int w, int h, int prefer_ycbcr);
 void video_present_shutdown(void);
 int video_present_should_drop(void);

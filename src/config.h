@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <Limelight.h>
+#include "video/video.h"
 
 #define CONFIG_DIR_PS4 "/data/moonlight"
 #define CONFIG_MAX_HOST 128
@@ -22,6 +23,7 @@ typedef struct {
     bool prefer_ycbcr;
     bool enable_file_log; // writes /data/moonlight/debug.log
     bool show_stats; // on-screen perf overlay (FPS/decode/convert/present/KB per frame)
+    video_scaling_mode_t scaling_mode;
     bool paired_ok; // runtime only
 
     /* Videodec2 tuning, A/B-able on console without a rebuild. Rev-2 defaults

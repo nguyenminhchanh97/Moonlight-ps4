@@ -34,7 +34,7 @@ static int s_ring_tail; // write sample index
 static int s_ring_count;
 
 static short s_outbuf[AUDIO_GRAIN * MAX_CHANNELS];
-static short s_decbuf[512 * MAX_CHANNELS];
+static short *s_decbuf;
 
 static int ar_init(int audioConfiguration, const POPUS_MULTISTREAM_CONFIGURATION opusConfig,
                    void *context, int arFlags) {
@@ -48,6 +48,18 @@ static int ar_init(int audioConfiguration, const POPUS_MULTISTREAM_CONFIGURATION
         return -1;
     }
     s_samples_per_frame = opusConfig->samplesPerFrame;
+    if (s_channels < 1 || s_samples_per_frame < 1 ||
+        (size_t)s_samples_per_frame > SIZE_MAX / ((size_t)s_channels * sizeof(short))) {
+        LOGE("audio: invalid Opus configuration channels=%d samples=%d",
+             s_channels, s_samples_per_frame);
+        return -1;
+    }
+    s_decbuf = (short *)malloc((size_t)s_samples_per_frame *
+                               (size_t)s_channels * sizeof(short));
+    if (!s_decbuf) {
+        LOGE("audio: decode buffer allocation failed");
+        return -1;
+    }
 
     // Orbis only accepts 48000 in practice for MAIN; Moonlight Opus is 48 kHz.
     rate = opusConfig->sampleRate;
@@ -62,6 +74,8 @@ static int ar_init(int audioConfiguration, const POPUS_MULTISTREAM_CONFIGURATION
         opusConfig->coupledStreams, opusConfig->mapping, &err);
     if (!s_decoder) {
         LOGE("audio: opus_multistream_decoder_create failed: %d", err);
+        free(s_decbuf);
+        s_decbuf = NULL;
         return -1;
     }
 
@@ -72,6 +86,10 @@ static int ar_init(int audioConfiguration, const POPUS_MULTISTREAM_CONFIGURATION
     rc = sceAudioOutInit();
     if (rc != 0 && (uint32_t)rc != AUDIO_OUT_ALREADY_INIT) {
         LOGE("audio: sceAudioOutInit failed: 0x%08x", (unsigned)rc);
+        opus_multistream_decoder_destroy(s_decoder);
+        s_decoder = NULL;
+        free(s_decbuf);
+        s_decbuf = NULL;
         return -1;
     }
     LOGI("audio: sceAudioOutInit => 0x%08x", (unsigned)rc);
@@ -96,6 +114,10 @@ static int ar_init(int audioConfiguration, const POPUS_MULTISTREAM_CONFIGURATION
     }
     if (s_handle <= 0) {
         LOGE("audio: sceAudioOutOpen failed: 0x%08x", (unsigned)s_handle);
+        opus_multistream_decoder_destroy(s_decoder);
+        s_decoder = NULL;
+        free(s_decbuf);
+        s_decbuf = NULL;
         return -1;
     }
 
@@ -115,9 +137,16 @@ static void ar_cleanup(void) {
         opus_multistream_decoder_destroy(s_decoder);
         s_decoder = NULL;
     }
+    free(s_decbuf);
+    s_decbuf = NULL;
 }
 
 static void ring_push(const short *pcm, int samples) {
+    if (samples >= RING_SAMPLES) {
+        pcm += (size_t)(samples - RING_SAMPLES) * (size_t)s_channels;
+        samples = RING_SAMPLES;
+        s_ring_head = s_ring_tail = s_ring_count = 0;
+    }
     if (s_ring_count + samples > RING_SAMPLES) {
         // Overflow: drop oldest samples to avoid accumulating latency.
         int drop = s_ring_count + samples - RING_SAMPLES;

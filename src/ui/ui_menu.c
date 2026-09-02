@@ -82,6 +82,7 @@ enum {
     SET_HOST = 0,
     SET_DEBUG_HOST,
     SET_RES,
+    SET_SCALING,
     SET_FPS,
     SET_BITRATE,
     SET_SOPS,
@@ -97,10 +98,11 @@ static const char *k_set_names[SET_COUNT] = {
     "Host",
     "Debug host",
     "Resolution",
+    "Display scaling",
     "FPS",
     "Bitrate (kbps)",
     "SOPS",
-    "Local audio",
+    "Host audio",
     "Decoder HW",
     "YCbCr (experimental)",
     "File logging",
@@ -213,10 +215,17 @@ static void set_value_str(const ui_state_t *st, int row, char *out, size_t cap) 
     case SET_HOST:        snprintf(out, cap, "%s", c->host); break;
     case SET_DEBUG_HOST:  snprintf(out, cap, "%s", c->debug_host); break;
     case SET_RES:         snprintf(out, cap, "%dx%d", c->stream.width, c->stream.height); break;
+    case SET_SCALING:
+        snprintf(out, cap, "%s",
+                 c->scaling_mode == VIDEO_SCALING_FIT ? "Fit" :
+                 c->scaling_mode == VIDEO_SCALING_FILL ? "Fill" : "Stretch");
+        break;
     case SET_FPS:         snprintf(out, cap, "%d", c->stream.fps); break;
     case SET_BITRATE:     snprintf(out, cap, "%d", c->stream.bitrate); break;
     case SET_SOPS:        snprintf(out, cap, "%s", c->sops ? "yes" : "no"); break;
-    case SET_LOCAL_AUDIO: snprintf(out, cap, "%s", c->local_audio ? "yes" : "no"); break;
+    case SET_LOCAL_AUDIO:
+        snprintf(out, cap, "%s", c->local_audio ? "Remote + host" : "Remote only");
+        break;
     case SET_PREFER_HW:   snprintf(out, cap, "%s", c->prefer_hw ? "yes" : "no"); break;
     case SET_PREFER_YCBCR:snprintf(out, cap, "%s", c->prefer_ycbcr ? "yes" : "no"); break;
     case SET_FILE_LOG:    snprintf(out, cap, "%s", c->enable_file_log ? "yes" : "no"); break;
@@ -226,8 +235,10 @@ static void set_value_str(const ui_state_t *st, int row, char *out, size_t cap) 
 }
 
 static void cycle_res(app_config_t *c, int dir) {
-    static const int presets[][2] = { {1280, 720}, {1920, 1080} };
-    const int n = 2;
+    static const int presets[][2] = {
+        {1280, 720}, {1920, 1080}, {2560, 1080}, {3440, 1440}
+    };
+    const int n = (int)(sizeof(presets) / sizeof(presets[0]));
     int cur = 1;
     for (int i = 0; i < n; i++) {
         if (c->stream.width == presets[i][0] && c->stream.height == presets[i][1]) {
@@ -368,6 +379,11 @@ static void settings_input(ui_state_t *st, unsigned pr) {
     case SET_RES:
         cycle_res(c, dir ? dir : 1);
         break;
+    case SET_SCALING: {
+        int mode = (int)c->scaling_mode + (dir ? dir : 1);
+        c->scaling_mode = (video_scaling_mode_t)((mode + 3) % 3);
+        break;
+    }
     case SET_FPS:
         c->stream.fps = (c->stream.fps == 60) ? 30 : 60;
         break;
