@@ -20,9 +20,9 @@ jobs:
 
       - name: Setup OpenOrbis and HostLibs
         run: |
-          mkdir -p $HOME/ps4dev/OpenOrbis
-          curl -L -o /tmp/oo.tar.gz "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz"
-          tar -xzf /tmp/oo.tar.gz -C $HOME/ps4dev/OpenOrbis
+          mkdir -p $HOME/ps4dev
+	  curl -L -o /tmp/oo.tar.gz "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz"
+	  tar -xzf /tmp/oo.tar.gz -C $HOME/ps4dev
           mkdir -p $HOME/ps4dev/hostlibs/usr/lib
           cp /usr/lib/x86_64-linux-gnu/libssl.so.1.1 $HOME/ps4dev/hostlibs/usr/lib/
           cp /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 $HOME/ps4dev/hostlibs/usr/lib/
