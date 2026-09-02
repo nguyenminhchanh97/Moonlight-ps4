@@ -9,6 +9,7 @@
 #include "audio/audio_orbis.h"
 #include "video/video.h"
 #include "input/input_pad.h"
+#include "input/input_usb.h"
 #include "input/keyboard_ps4.h"
 #include "input/mouse_ps4.h"
 #include "ui/ui_menu.h"
@@ -278,18 +279,18 @@ start_ok:
         return -1;
     }
 
-    LOGI("main loop; OPTIONS+TOUCHPAD 1s to quit");
+    if (input_usb_start() != 0)
+        LOGW("stream: USB input thread unavailable");
+    LOGI("main loop; hold OPTIONS+TOUCHPAD 1s to disconnect");
 
     int ticks = 0;
     while (!input_poll()) {
-        keyboard_ps4_poll();
-        mouse_ps4_poll();
         usleep(8000);
         if (++ticks % 125 == 0) {
             video_stats_t st;
             video_get_stats(&st);
-            LOGI("stats t=%d connected=%d frames=%u decodes=%u drop=%u",
-                 ticks, s_connected, st.frames, st.decodes, st.dropped);
+            LOGI("stream-stats: requested=%dfps decoded=%u presented=%u drops=%u connected=%d",
+                 cfg->stream.fps, st.decodes, st.frames, st.dropped, s_connected);
             if (st.frames || st.decodes) {
                 double nd = st.decodes ? (double)st.decodes : 1.0;
                 double nf = st.frames ? (double)st.frames : 1.0;
@@ -310,10 +311,15 @@ start_ok:
         }
     }
 
-    LOGI("leaving loop (quit or disconnect)");
+    LOGN("Disconnecting...");
+    LOGI("shutdown: signal received; stopping USB input thread");
+    input_usb_stop();
+    LOGI("shutdown: releasing held keyboard and mouse state");
     keyboard_ps4_release_all();
     mouse_ps4_release_all();
+    LOGI("shutdown: LiStopConnection begin");
     LiStopConnection();
+    LOGI("shutdown: LiStopConnection complete (network/audio/video workers joined)");
     /* No gs_quit_app: leave the game on Sunshine for resume → "paused". */
     LOGN("Stream paused");
     LOGI("stream_play done OK → return to menu");

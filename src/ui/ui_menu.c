@@ -220,7 +220,10 @@ static void set_value_str(const ui_state_t *st, int row, char *out, size_t cap) 
                  c->scaling_mode == VIDEO_SCALING_FIT ? "Fit" :
                  c->scaling_mode == VIDEO_SCALING_FILL ? "Fill" : "Stretch");
         break;
-    case SET_FPS:         snprintf(out, cap, "%d", c->stream.fps); break;
+    case SET_FPS:
+        snprintf(out, cap, c->stream.fps > 60 ? "%d Experimental" : "%d",
+                 c->stream.fps);
+        break;
     case SET_BITRATE:     snprintf(out, cap, "%d", c->stream.bitrate); break;
     case SET_SOPS:        snprintf(out, cap, "%s", c->sops ? "yes" : "no"); break;
     case SET_LOCAL_AUDIO:
@@ -385,7 +388,14 @@ static void settings_input(ui_state_t *st, unsigned pr) {
         break;
     }
     case SET_FPS:
-        c->stream.fps = (c->stream.fps == 60) ? 30 : 60;
+        {
+            static const int values[] = {30, 60, 90, 120};
+            int at = 1;
+            for (int i = 0; i < 4; i++)
+                if (c->stream.fps == values[i]) at = i;
+            at = (at + (dir ? dir : 1) + 4) % 4;
+            c->stream.fps = values[at];
+        }
         break;
     case SET_BITRATE: {
         int b = c->stream.bitrate + (dir ? dir : 1) * 5000;

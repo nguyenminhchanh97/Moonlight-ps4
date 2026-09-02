@@ -49,6 +49,7 @@ static int s_last_flip_idx = -1;
 static int s_flip_wait_logs;
 static int s_show_stats;
 static video_scaling_mode_t s_scaling_mode = VIDEO_SCALING_STRETCH;
+static int s_scale_logged;
 
 /*
  * BGRA MT: workers claim row bands off an atomic counter, so a slow band does
@@ -112,6 +113,24 @@ static int calculate_scale_rect(int src_w, int src_h, int dst_w, int dst_h,
     if (r->src_x + r->src_w > src_w) r->src_w = src_w - r->src_x;
     if (r->src_y + r->src_h > src_h) r->src_h = src_h - r->src_y;
     return r->src_w > 0 && r->src_h > 0 && r->dst_w > 0 && r->dst_h > 0 ? 0 : -1;
+}
+
+static const char *scaling_name(video_scaling_mode_t mode) {
+    return mode == VIDEO_SCALING_FIT ? "fit" :
+           mode == VIDEO_SCALING_FILL ? "fill" : "stretch";
+}
+
+static void log_scale_once(int src_w, int src_h, int dst_w, int dst_h) {
+    if (s_scale_logged) return;
+    video_scale_rect_t r;
+    if (calculate_scale_rect(src_w, src_h, dst_w, dst_h, s_scaling_mode, &r) != 0)
+        return;
+    s_scale_logged = 1;
+    LOGI("video-layout: decoded/source=%dx%d framebuffer=%dx%d scaling=%s "
+         "source_crop=%d,%d %dx%d destination=%d,%d %dx%d",
+         src_w, src_h, dst_w, dst_h, scaling_name(s_scaling_mode),
+         r.src_x, r.src_y, r.src_w, r.src_h,
+         r.dst_x, r.dst_y, r.dst_w, r.dst_h);
 }
 
 #define BGRA_WORKERS_MAX 6
@@ -797,6 +816,7 @@ void video_present_set_scaling(video_scaling_mode_t mode) {
     if (mode < VIDEO_SCALING_FIT || mode > VIDEO_SCALING_FILL)
         mode = VIDEO_SCALING_STRETCH;
     s_scaling_mode = mode;
+    s_scale_logged = 0;
     LOGI("present: scaling=%s", mode == VIDEO_SCALING_FIT ? "fit" :
          mode == VIDEO_SCALING_FILL ? "fill" : "stretch");
 }
@@ -853,6 +873,7 @@ static int bgra_convert_kick(uint8_t *dst, int dst_pitch,
     video_scale_rect_t r;
     if (calculate_scale_rect(src_w, src_h, dst_w, dst_h, s_scaling_mode, &r) != 0)
         return -1;
+    log_scale_once(src_w, src_h, dst_w, dst_h);
     if (s_scaling_mode == VIDEO_SCALING_FIT &&
         (r.dst_w != dst_w || r.dst_h != dst_h))
         memset(dst, 0, (size_t)dst_pitch * (size_t)dst_h);
@@ -1009,6 +1030,20 @@ int video_present_init(int w, int h, int prefer_ycbcr) {
         return -1;
     }
     sceVideoOutSetFlipRate(s_video, ML_VIDEO_OUT_FLIP_60HZ);
+    {
+        MlVideoOutResolutionStatus status;
+        memset(&status, 0, sizeof(status));
+        int src = sceVideoOutGetResolutionStatus(s_video, &status);
+        if (src == 0) {
+            LOGI("videoout: HDMI/status=%ux%u pane=%ux%u refresh=%llu (raw units) "
+                 "framebuffer=%dx%d flip_rate=60Hz",
+                 status.width, status.height, status.paneWidth, status.paneHeight,
+                 (unsigned long long)status.refreshRate, w, h);
+        } else {
+            LOGW("videoout: GetResolutionStatus failed=0x%08x framebuffer=%dx%d",
+                 (unsigned)src, w, h);
+        }
+    }
 
     if (!prefer_ycbcr)
         goto bgra_debug;

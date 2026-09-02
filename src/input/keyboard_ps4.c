@@ -16,7 +16,8 @@
 #define KEYS_OFFSET 0x20
 #define KEY_COUNT 32
 #define DIAGNOSTIC_SIZE 64
-#define PHYSICAL_KEY_FLAG 0x8000
+#define KEYBOARD_PORTS 4
+#define DIAGNOSTIC_INTERVAL_US 250000u
 
 /*
  * OpenOrbis models this as a 96-byte state containing nkeys at 0x14, 32-bit
@@ -91,7 +92,8 @@ typedef int32_t (*KeyboardReadStateFn)(int32_t, void *);
 typedef int32_t (*KeyboardCloseFn)(int32_t);
 
 static int s_module = -1;
-static int32_t s_handle = -1;
+static int32_t s_handles[KEYBOARD_PORTS] = {-1, -1, -1, -1};
+static int s_active_port = -1;
 static KeyboardReadStateFn s_read_state;
 static KeyboardCloseFn s_close;
 static KeyboardState s_previous;
@@ -99,6 +101,9 @@ static uint8_t s_previous_raw[DIAGNOSTIC_SIZE];
 static unsigned s_raw_changes;
 static bool s_have_raw;
 static int s_last_read_class = -1;
+static uint64_t s_next_diagnostic_us;
+static uint64_t s_next_raw_us;
+static const char *s_decoder_name = "unselected";
 
 static bool decode(const uint8_t raw[RAW_SIZE], KeyboardState *state) {
     int32_t count;
@@ -106,13 +111,27 @@ static bool decode(const uint8_t raw[RAW_SIZE], KeyboardState *state) {
     memcpy(&count, raw + KEY_COUNT_OFFSET, sizeof(count));
     memcpy(&modifiers, raw + MODIFIERS_OFFSET, sizeof(modifiers));
     if (count < 0 || count > KEY_COUNT) {
-        LOGW("keyboard: invalid decoded key count %d; ABI mismatch", count);
         return false;
     }
     memset(state, 0, sizeof(*state));
     state->modifiers = (uint8_t)modifiers;
     memcpy(state->keys, raw + KEYS_OFFSET, (size_t)count * sizeof(state->keys[0]));
     return true;
+}
+
+/* Early public guesses model a boot-keyboard report at 0x0c/0x0e. Keep this
+ * isolated and require recognized activity before selecting it. */
+static bool decode_boot_report(const uint8_t raw[RAW_SIZE], KeyboardState *state) {
+    memset(state, 0, sizeof(*state));
+    state->modifiers = raw[0x0c];
+    for (int i = 0; i < 6; i++) state->keys[i] = raw[0x0e + i];
+    return true;
+}
+
+static bool has_recognized_activity(const KeyboardState *state) {
+    for (int i = 0; i < KEY_COUNT; i++)
+        if (state->keys[i] < 256 && hid_to_vk[state->keys[i]]) return true;
+    return false;
 }
 
 static uint8_t modifiers_for(uint8_t hid) {
@@ -133,7 +152,7 @@ static bool has_key(const uint16_t keys[KEY_COUNT], uint16_t key) {
 static void send_modifier(uint8_t changed, uint8_t current, uint8_t mask,
                           uint16_t vk, uint8_t modifiers) {
     if (changed & mask)
-        LiSendKeyboardEvent((short)(vk | PHYSICAL_KEY_FLAG),
+        LiSendKeyboardEvent((short)vk,
                             (current & mask) ? KEY_ACTION_DOWN : KEY_ACTION_UP,
                             (char)modifiers);
 }
@@ -155,8 +174,10 @@ static void log_raw(const uint8_t raw[RAW_SIZE]) {
     if (s_have_raw && memcmp(s_previous_raw, raw, sizeof(s_previous_raw)) == 0) return;
     memcpy(s_previous_raw, raw, sizeof(s_previous_raw));
     s_have_raw = true;
+    uint64_t now = sceKernelGetProcessTime();
+    if (now < s_next_raw_us) return;
+    s_next_raw_us = now + DIAGNOSTIC_INTERVAL_US;
     s_raw_changes++;
-    if (s_raw_changes > 32 && (s_raw_changes % 125) != 0) return;
 
     char text[DIAGNOSTIC_SIZE * 3 + 1];
     size_t used = 0;
@@ -201,9 +222,15 @@ bool keyboard_ps4_init(void) {
         LOGE("keyboard: get initial user failed: 0x%08x", result);
         return false;
     }
-    s_handle = open(user_id, 0, 0, NULL);
-    if (s_handle < 0) {
-        LOGE("keyboard: sceKeyboardOpen failed: 0x%08x", s_handle);
+    int opened = 0;
+    for (int port = 0; port < KEYBOARD_PORTS; port++) {
+        s_handles[port] = open(user_id, 0, port, NULL);
+        LOGI("keyboard: open user=%d type=0 index=%d => 0x%08x",
+             user_id, port, s_handles[port]);
+        if (s_handles[port] >= 0) opened++;
+    }
+    if (!opened) {
+        LOGE("keyboard: no keyboard index could be opened");
         return false;
     }
 
@@ -212,35 +239,76 @@ bool keyboard_ps4_init(void) {
     s_raw_changes = 0;
     s_have_raw = false;
     s_last_read_class = -1;
-    LOGI("keyboard: opened handle=0x%08x; decoder ABI from OpenOrbis", s_handle);
+    s_active_port = -1;
+    s_next_diagnostic_us = 0;
+    s_next_raw_us = 0;
+    s_decoder_name = "unselected";
+    LOGI("keyboard: %d handles open; probing OpenOrbis-state and boot-report ABIs", opened);
     return true;
 }
 
 void keyboard_ps4_poll(void) {
-    if (s_handle < 0 || !s_read_state) return;
+    if (!s_read_state) return;
 
+    int first = s_active_port >= 0 ? s_active_port : 0;
+    int last = s_active_port >= 0 ? s_active_port + 1 : KEYBOARD_PORTS;
+    for (int port = first; port < last; port++) {
+    if (s_handles[port] < 0) continue;
     _Alignas(16) uint8_t raw[RAW_SIZE] = {0};
-    int32_t result = s_read_state(s_handle, raw);
+    int32_t result = s_read_state(s_handles[port], raw);
     int read_class = result < 0 ? 0 : 1;
     if (read_class != s_last_read_class) {
-        LOGI("keyboard: sceKeyboardReadState result=0x%08x", result);
+        LOGI("keyboard: index=%d handle=0x%08x ReadState=0x%08x",
+             port, s_handles[port], result);
         s_last_read_class = read_class;
     }
     if (result < 0) {
         keyboard_ps4_release_all();
-        return;
+        continue;
     }
 
     log_raw(raw);
     KeyboardState current;
-    if (!decode(raw, &current)) return;
+    bool openorbis_ok = decode(raw, &current);
+    if (s_active_port < 0) {
+        if (openorbis_ok && has_recognized_activity(&current)) {
+            s_active_port = port;
+            s_decoder_name = "OpenOrbis-state@14/1c/20";
+        } else {
+            decode_boot_report(raw, &current);
+            if (has_recognized_activity(&current)) {
+                s_active_port = port;
+                s_decoder_name = "boot-report@0c/0e";
+            } else {
+                uint64_t now = sceKernelGetProcessTime();
+                if (now >= s_next_diagnostic_us) {
+                    int32_t nkeys = 0;
+                    uint32_t mods = 0;
+                    memcpy(&nkeys, raw + KEY_COUNT_OFFSET, sizeof(nkeys));
+                    memcpy(&mods, raw + MODIFIERS_OFFSET, sizeof(mods));
+                    LOGI("keyboard-diag: index=%d rc=0 nkeys@14=%d mods@1c=%08x "
+                         "bootmods@0c=%02x bootkeys@0e=%02x,%02x,%02x,%02x,%02x,%02x",
+                         port, nkeys, mods, raw[0x0c], raw[0x0e], raw[0x0f],
+                         raw[0x10], raw[0x11], raw[0x12], raw[0x13]);
+                    s_next_diagnostic_us = now + DIAGNOSTIC_INTERVAL_US;
+                }
+                continue;
+            }
+        }
+        LOGI("keyboard: selected index=%d handle=0x%08x decoder=%s",
+             port, s_handles[port], s_decoder_name);
+    } else if (!strcmp(s_decoder_name, "boot-report@0c/0e")) {
+        decode_boot_report(raw, &current);
+    } else if (!openorbis_ok) {
+        continue;
+    }
 
     uint8_t modifiers = modifiers_for(current.modifiers);
     for (size_t i = 0; i < KEY_COUNT; i++) {
         uint16_t usage = s_previous.keys[i];
         uint16_t vk = usage < 256 ? hid_to_vk[usage] : 0;
         if (usage && vk && !has_key(current.keys, usage))
-            LiSendKeyboardEvent((short)(vk | PHYSICAL_KEY_FLAG),
+            LiSendKeyboardEvent((short)vk,
                                 KEY_ACTION_UP, (char)modifiers);
     }
     send_modifier_changes(s_previous.modifiers, current.modifiers);
@@ -248,10 +316,11 @@ void keyboard_ps4_poll(void) {
         uint16_t usage = current.keys[i];
         uint16_t vk = usage < 256 ? hid_to_vk[usage] : 0;
         if (usage && vk && !has_key(s_previous.keys, usage))
-            LiSendKeyboardEvent((short)(vk | PHYSICAL_KEY_FLAG),
+            LiSendKeyboardEvent((short)vk,
                                 KEY_ACTION_DOWN, (char)modifiers);
     }
     s_previous = current;
+    }
 }
 
 void keyboard_ps4_release_all(void) {
@@ -260,7 +329,7 @@ void keyboard_ps4_release_all(void) {
         uint16_t usage = s_previous.keys[i];
         uint16_t vk = usage < 256 ? hid_to_vk[usage] : 0;
         if (usage && vk)
-            LiSendKeyboardEvent((short)(vk | PHYSICAL_KEY_FLAG),
+            LiSendKeyboardEvent((short)vk,
                                 KEY_ACTION_UP, (char)modifiers);
     }
     send_modifier_changes(s_previous.modifiers, 0);
@@ -268,8 +337,11 @@ void keyboard_ps4_release_all(void) {
 }
 
 void keyboard_ps4_shutdown(void) {
-    if (s_handle >= 0 && s_close) s_close(s_handle);
-    s_handle = -1;
+    for (int port = 0; port < KEYBOARD_PORTS; port++) {
+        if (s_handles[port] >= 0 && s_close) s_close(s_handles[port]);
+        s_handles[port] = -1;
+    }
+    s_active_port = -1;
     s_read_state = NULL;
     s_close = NULL;
 }
