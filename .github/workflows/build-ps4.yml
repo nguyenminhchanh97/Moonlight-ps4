@@ -1,0 +1,73 @@
+name: Build PS4
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm cmake ninja-build git curl build-essential python3 libssl1.1 tar
+
+      - name: Setup OpenOrbis and HostLibs
+        run: |
+          mkdir -p $HOME/ps4dev/OpenOrbis
+          curl -L -o /tmp/oo.tar.gz "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/OpenOrbis-PS4-Toolchain-v0.5.4.tar.gz"
+          tar -xzf /tmp/oo.tar.gz -C $HOME/ps4dev/OpenOrbis
+          mkdir -p $HOME/ps4dev/hostlibs/usr/lib
+          cp /usr/lib/x86_64-linux-gnu/libssl.so.1.1 $HOME/ps4dev/hostlibs/usr/lib/
+          cp /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 $HOME/ps4dev/hostlibs/usr/lib/
+
+      - name: Diagnostics
+        run: |
+          clang --version
+          cmake --version
+          ninja --version
+          echo "OO_PS4_TOOLCHAIN=$HOME/ps4dev/OpenOrbis/PS4Toolchain"
+          echo "PS4_HOSTLIBS=$HOME/ps4dev/hostlibs/usr/lib"
+          ls -la $HOME/ps4dev/OpenOrbis/PS4Toolchain
+          ls -la $HOME/ps4dev/hostlibs/usr/lib
+
+      - name: Setup Repository Dependencies
+        run: |
+          export OO_PS4_TOOLCHAIN=$HOME/ps4dev/OpenOrbis/PS4Toolchain
+          ./scripts/setup_deps.sh
+
+      - name: Build PS4 FFmpeg
+        run: |
+          export OO_PS4_TOOLCHAIN=$HOME/ps4dev/OpenOrbis/PS4Toolchain
+          ./scripts/build_ffmpeg_ps4.sh
+          echo "Verifying FFmpeg output:"
+          ls -la $HOME/ps4dev/ffmpeg-ps4/lib/libavcodec.a
+
+      - name: Build Moonlight PS4
+        run: |
+          export OO_PS4_TOOLCHAIN=$HOME/ps4dev/OpenOrbis/PS4Toolchain
+          export PS4_HOSTLIBS=$HOME/ps4dev/hostlibs/usr/lib
+          ./scripts/build_pkg.sh
+
+      - name: Verify PKG and Calculate SHA256
+        run: |
+          PKG_PATH=$(find build-ps4/ -name "*.pkg" | head -n 1)
+          if [ -z "$PKG_PATH" ]; then
+            echo "Error: Final .pkg not found!"
+            exit 1
+          fi
+          echo "Final PKG found: $PKG_PATH"
+          sha256sum "$PKG_PATH"
+
+      - name: Upload PKG Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Moonlight-PS4-PKG
+          path: build-ps4/*.pkg
+          if-no-files-found: error

@@ -9,6 +9,7 @@
 #include "audio/audio_orbis.h"
 #include "video/video.h"
 #include "input/input_pad.h"
+#include "input/input_spike.h"
 #include "ui/ui_menu.h"
 
 #include <stdio.h>
@@ -259,6 +260,7 @@ start_ok:
 
     int ticks = 0;
     while (!input_poll()) {
+        input_spike_poll();
         usleep(8000);
         if (++ticks % 125 == 0) {
             video_stats_t st;
@@ -310,6 +312,7 @@ int stream_run(app_config_t *cfg, const char *config_dir) {
         LOGW("input_init failed; menu without pad (auto-launch)");
     } else {
         LOGI("input_init OK");
+        input_spike_init();
     }
 
     int connected = 0;
