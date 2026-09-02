@@ -20,10 +20,11 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 
 static gs_server_t s_server;
 static client_identity_t s_id;
-static volatile int s_connected;
+static atomic_int s_connected;
 static char s_stream_title[CONFIG_MAX_APP];
 
 static void cl_stage_starting(int stage) {
@@ -35,14 +36,14 @@ static void cl_stage_failed(int stage, int errorCode) {
     LOGE("connection: stage FAIL %s (%d) err=%d", name, stage, errorCode);
 }
 static void cl_connection_started(void) {
-    s_connected = 1;
+    atomic_store_explicit(&s_connected, 1, memory_order_release);
     LOGI("connection: streaming active");
     if (s_stream_title[0])
         LOGN("%s", s_stream_title);
 }
 static void cl_connection_terminated(int errorCode) {
     LOGE("connection: terminated err=%d", errorCode);
-    s_connected = 0;
+    atomic_store_explicit(&s_connected, 0, memory_order_release);
     input_request_quit();
 }
 static void cl_log(const char *format, ...) {
@@ -122,7 +123,7 @@ static int stream_connect(app_config_t *cfg, const char *config_dir) {
             if (fgets(pin, sizeof(pin), f))
                 pin[strcspn(pin, " \r\n")] = '\0';
             fclose(f);
-            LOGI("pin.txt read: '%s'", pin);
+            LOGI("pin.txt read");
         } else {
             LOGI("pin.txt does not exist yet");
         }
@@ -134,7 +135,7 @@ static int stream_connect(app_config_t *cfg, const char *config_dir) {
             if (f) {
                 fputs(pin, f);
                 fclose(f);
-                LOGI("PIN written to %s = %s", path, pin);
+                LOGI("pairing PIN written to %s", path);
             } else {
                 LOGE("fwrite pin FAIL path=%s errno=%d", path, errno);
             }
@@ -144,8 +145,8 @@ static int stream_connect(app_config_t *cfg, const char *config_dir) {
         snprintf(pin_line, sizeof(pin_line), "PIN: %s", pin);
         snprintf(line, sizeof(line), "Enter the PIN in Sunshine (%s)", cfg->host);
         ui_show_status("PAIR", pin_line, line);
-        LOGI(">>> PAIRING PIN=%s  -> https://%s:47990/pin  (timeout 120s)",
-             pin, cfg->host);
+        LOGI(">>> PAIRING request -> https://%s:47990/pin (timeout 120s)",
+             cfg->host);
 
         http_set_timeout_ms(120000);
         int pair_rc = gs_pair(&s_server, pin);
@@ -169,7 +170,7 @@ static int stream_connect(app_config_t *cfg, const char *config_dir) {
 
 /* One stream session: launch + LiStartConnection + loop until exit. */
 static int stream_play(app_config_t *cfg) {
-    s_connected = 0;
+    atomic_store_explicit(&s_connected, 0, memory_order_release);
     snprintf(s_stream_title, sizeof(s_stream_title), "%s", cfg->app_name);
 
     int app_id = resolve_app_id(&s_server, cfg->app_name);
@@ -290,7 +291,8 @@ start_ok:
             video_stats_t st;
             video_get_stats(&st);
             LOGI("stream-stats: requested=%dfps decoded=%u presented=%u drops=%u connected=%d",
-                 cfg->stream.fps, st.decodes, st.frames, st.dropped, s_connected);
+                 cfg->stream.fps, st.decodes, st.frames, st.dropped,
+                 atomic_load_explicit(&s_connected, memory_order_acquire));
             if (st.frames || st.decodes) {
                 double nd = st.decodes ? (double)st.decodes : 1.0;
                 double nf = st.frames ? (double)st.frames : 1.0;
@@ -305,7 +307,7 @@ start_ok:
                 video_reset_stats();
             }
         }
-        if (!s_connected && ticks > 250) {
+        if (!atomic_load_explicit(&s_connected, memory_order_acquire) && ticks > 250) {
             LOGE("stream: connection lost after %d ticks", ticks);
             break;
         }
@@ -327,7 +329,7 @@ start_ok:
 }
 
 int stream_run(app_config_t *cfg, const char *config_dir) {
-    s_connected = 0;
+    atomic_store_explicit(&s_connected, 0, memory_order_release);
 
     LOGI("identity_init(%s)...", config_dir);
     if (identity_init(&s_id, config_dir) != GS_OK) {

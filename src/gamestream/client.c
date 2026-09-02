@@ -241,7 +241,7 @@ int gs_pair(gs_server_t *server, const char *pin) {
         return GS_WRONG_STATE;
     }
 
-    LOGI("pairing: phase 1, getservercert (PIN=%s)", pin);
+    LOGI("pairing: phase 1, getservercert");
     LOGI("pair f1...");
 
     // --- Phase 1: salt + client certificate -> server certificate

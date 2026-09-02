@@ -264,10 +264,16 @@ void keyboard_ps4_poll(void) {
     }
     if (result < 0) {
         keyboard_ps4_release_all();
+        if (s_active_port == port) {
+            LOGW("keyboard: active index=%d unavailable; resuming port probe", port);
+            s_active_port = -1;
+            s_decoder_name = "unselected";
+        }
         continue;
     }
 
-    log_raw(raw);
+    if (s_active_port < 0)
+        log_raw(raw);
     KeyboardState current;
     bool openorbis_ok = decode(raw, &current);
     if (s_active_port < 0) {
